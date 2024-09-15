@@ -1,5 +1,5 @@
 # All source paths should be relative to the top level.
-LD_FILE = $(BOARD_PATH)/deluge.ld
+LD_FILE = ${BOARD_PATH}/deluge.ld
 
 
 # For flash-jlink target

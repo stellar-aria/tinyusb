@@ -42,7 +42,7 @@ typedef struct {
   int32_t irqnum;
 }rusb2_controller_t;
 
-#define RUSB2_CONTROLLER_COUNT 2
+#define RUSB2_CONTROLLER_COUNT USB20_COUNT
 
 #define rusb2_is_highspeed_rhport(_p)  (true)
 #define rusb2_is_highspeed_reg(_reg)   (true)
@@ -55,12 +55,15 @@ extern rusb2_controller_t rusb2_controller[];
 //--------------------------------------------------------------------+
 
 TU_ATTR_ALWAYS_INLINE static inline void rusb2_module_start(uint8_t rhport, bool start) {
-  uint32_t const mask = 1U << (11+rhport);
+  //TODO: Needs replacing
+  (void) rhport;
+  (void) start;
+/*   uint32_t const mask = 1U << (11+rhport);
   if (start) {
     R_MSTP->MSTPCRB &= ~mask;
   }else {
     R_MSTP->MSTPCRB |= mask;
-  }
+  } */
 }
 
 TU_ATTR_ALWAYS_INLINE static inline void rusb2_int_enable(uint8_t rhport) {
@@ -73,6 +76,7 @@ TU_ATTR_ALWAYS_INLINE static inline void rusb2_int_disable(uint8_t rhport) {
 
 // MCU specific PHY init
 TU_ATTR_ALWAYS_INLINE static inline void rusb2_phy_init(void) {
+  // TODO: might need special init stuff?
 }
 
 

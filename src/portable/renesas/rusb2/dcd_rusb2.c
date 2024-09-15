@@ -45,7 +45,8 @@
     #define D0FIFOCTR CFIFOCTR
     #define D0FIFOCTR_b CFIFOCTR_b
   #endif
-
+#elif TU_CHECK_MCU(OPT_MCU_RZA1X)
+  #include "rusb2_rza1.h"
 #else
   #error "Unsupported MCU"
 #endif
