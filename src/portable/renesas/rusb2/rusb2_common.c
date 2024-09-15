@@ -53,6 +53,19 @@ void tusb_rusb2_set_irqnum(uint8_t rhport, int32_t irqnum) {
 //    R_BSP_SoftwareDelay(msec, BSP_DELAY_UNITS_MILLISECONDS);
 //  }
 
+#elif TU_CHECK_MCU(OPT_MCU_RZA1X)
+#include rusb2_rza1.h
+
+rusb2_controller_t rusb2_controller[] = {
+  { .reg_base = USB20_ADDRESS_LIST[0], .irqnum = USBI0_IRQn },
+  { .reg_base = USB20_ADDRESS_LIST[1], .irqnum = USBI1_IRQn },
+};
+
+// Application API for setting IRQ number. May throw warnings for missing prototypes.
+void tusb_rusb2_set_irqnum(uint8_t rhport, int32_t irqnum) {
+  rusb2_controller[rhport].irqnum = irqnum;
+}
+
 #else
   #error "Unsupported MCU"
 #endif

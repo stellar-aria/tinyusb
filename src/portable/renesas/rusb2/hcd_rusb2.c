@@ -36,6 +36,8 @@
   #include "rusb2_rx.h"
 #elif TU_CHECK_MCU(OPT_MCU_RAXXX)
   #include "rusb2_ra.h"
+#elif TU_CHECK_MCU(OPT_MCU_RZA1X)
+  #include "rusb2_rza1.h"
 #else
   #error "Unsupported MCU"
 #endif

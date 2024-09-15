@@ -1,0 +1,1 @@
+INCLUDE linker_settings_l.ld
