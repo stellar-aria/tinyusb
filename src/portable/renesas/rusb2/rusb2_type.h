@@ -92,7 +92,8 @@ typedef struct _ccrx_evenaccess {
 
     struct TU_ATTR_PACKED {
       volatile uint16_t USBE  : 1; /* [0..0] USB Operation Enable */
-      uint16_t                : 2;
+      volatile uint16_t UPLLE : 1; /* [1..1] USB Internal PLL Operation Enable */
+      volatile uint16_t UCKSEL: 1; /* [2..2] USP Clock Selection */
       volatile uint16_t DMRPU : 1; /* [3..3] D- Line Resistor Control */
       volatile uint16_t DPRPU : 1; /* [4..4] D+ Line Resistor Control */
       volatile uint16_t DRPD  : 1; /* [5..5] D+/D- Line Resistor Control */

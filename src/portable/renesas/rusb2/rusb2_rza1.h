@@ -32,6 +32,7 @@ extern "C" {
 #endif
 
 #include "iodefine_cfg.h"
+//#include "r_intc.h"
 
 //--------------------------------------------------------------------+
 //
@@ -58,25 +59,45 @@ TU_ATTR_ALWAYS_INLINE static inline void rusb2_module_start(uint8_t rhport, bool
   //TODO: Needs replacing
   (void) rhport;
   (void) start;
-/*   uint32_t const mask = 1U << (11+rhport);
-  if (start) {
-    R_MSTP->MSTPCRB &= ~mask;
-  }else {
-    R_MSTP->MSTPCRB |= mask;
-  } */
+
+  // Initialize the user-interrupt controller (INTC)
+  // R_INTC_Init()
+
+  // Start up the PLL stuff
+
 }
 
 TU_ATTR_ALWAYS_INLINE static inline void rusb2_int_enable(uint8_t rhport) {
-  NVIC_EnableIRQ(rusb2_controller[rhport].irqnum);
+  //R_INTC_Enable(rusb2_controller[rhport].irqnum);
+
+  uint32_t const interrupt = rusb2_controller[rhport].irqnum;
+  // Interrupt Set Enable register enables the interrupts that have a bit set in the written value
+  volatile uint32_t* addr = &INTC.ICDISER0;
+
+  /* Create mask data */
+  uint32_t mask = 1u << (interrupt & 0x1f);
+
+  /* Write ICDISERn   */
+  *(addr + (interrupt >> 5)) = mask;
 }
 
 TU_ATTR_ALWAYS_INLINE static inline void rusb2_int_disable(uint8_t rhport) {
-  NVIC_DisableIRQ(rusb2_controller[rhport].irqnum);
+  //R_INTC_Disable(rusb2_controller[rhport].irqnum);
+
+  uint32_t const interrupt = rusb2_controller[rhport].irqnum;
+  // Interrupt Clear Enable register disables the interrupts that have a bit set in the written value
+  volatile uint32_t* addr = &INTC.ICDICER0;
+
+  /* Create mask data */
+  uint32_t mask = 1u << (interrupt & 0x1f);
+
+  /* Write ICDICERn   */
+  *(addr + (interrupt >> 5)) = mask;
 }
 
 // MCU specific PHY init
 TU_ATTR_ALWAYS_INLINE static inline void rusb2_phy_init(void) {
-  // TODO: might need special init stuff?
+  // TODO: might need special init stuff
 }
 
 
