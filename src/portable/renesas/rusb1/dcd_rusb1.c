@@ -209,7 +209,7 @@ static bool sw_to_hw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
   }
 
   if (len >= 2) {
-    fifo_set_mbw(fifo, RUSB1_FIFOSEL_MBW_8BIT);
+    fifo_set_mbw(fifo, RUSB1_FIFOSEL_MBW_16BIT);
     *fifo->data = tu_unaligned_read16(buf);
     buf += 2;
     len -= 2;
