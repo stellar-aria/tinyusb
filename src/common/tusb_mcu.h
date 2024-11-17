@@ -428,7 +428,7 @@
   #define TUP_DCD_ENDPOINT_MAX    10
 
 #elif TU_CHECK_MCU(OPT_MCU_RZA1X)
-  #define TUP_USBIP_RUSB2
+  #define TUP_USBIP_RUSB1
   #define TUP_DCD_ENDPOINT_MAX    16
 
 //--------------------------------------------------------------------+

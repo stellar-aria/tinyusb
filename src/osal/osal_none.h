@@ -35,8 +35,9 @@ extern "C" {
 // TASK API
 //--------------------------------------------------------------------+
 
-#if CFG_TUH_ENABLED
-// currently only needed/available in host mode
+// Host driver needs to be able to issue delays, as does the RZA1X
+// driver
+#if CFG_TUH_ENABLED || TU_CHECK_MCU(OPT_MCU_RZA1X)
 TU_ATTR_WEAK void osal_task_delay(uint32_t msec);
 #endif
 
