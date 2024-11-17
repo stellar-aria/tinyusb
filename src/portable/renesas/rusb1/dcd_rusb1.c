@@ -774,18 +774,14 @@ void dcd_init(uint8_t rhport) {
   }
 
   // If HS operation is desired, enable it
-  if (TUD_OPT_HIGH_SPEED) {
-    REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_HSE, 1);
-  } else {
-    REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_HSE, 1);
-  }
+  REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_HSE, (TUD_OPT_HIGH_SPEED ? 1 : 0));
 
   // Select USB function mode
   REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_DCFM, 0);
 
   // Configure pulls
   REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_DRPD, 0); // D+/D- pulldowns
-  REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_DPRPU, 1);// D+ pullup
+  REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_DPRPU, 0);// D+ pullup
 
   // Enable the module
   REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_USBE, 1);
