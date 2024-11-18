@@ -1169,7 +1169,7 @@ void dcd_int_handler(uint8_t rhport) {
 
   // Device state changes
   if (is0 & USB_INTSTS0_DVST) {
-    switch (is0 & USB_INTSTS0_DVSQ) {
+    switch (REG_READ_FIELD(is0, USB_INTSTS0_DVSQ)) {
       case RUSB1_INTSTS0_DVSQ_DEFAULT:
         process_bus_reset(rhport);
         break;
