@@ -29,6 +29,10 @@
 
 #include "device/dcd.h"
 
+#if __cplusplus
+extern "C" {
+#endif
+
 TU_ATTR_PACKED_BEGIN
 
 typedef struct rusb1_pipe_config {
@@ -48,5 +52,9 @@ TU_ATTR_PACKED_END
 
 // Configure a pipe for use with a specific endpoint.
 bool rusb1_configure_pipe(uint8_t rhport, uint8_t ep, tusb_dir_t ep_dir, uint8_t pipe, rusb1_pipe_config_t const * desc_ep);
+
+#if __cplusplus
+}
+#endif
 
 #endif
