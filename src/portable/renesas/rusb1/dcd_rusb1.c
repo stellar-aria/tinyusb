@@ -1195,12 +1195,13 @@ void dcd_int_handler(uint8_t rhport) {
   // Control transfer stage changes
   if (is0 & USB_INTSTS0_CTRT) {
     unsigned control_stage = REG_READ_FIELD(is0, USB_INTSTS0_CTSQ);
-    if (control_stage == RUSB1_INTSTS0_CTSQ_READ_DATA) {
-      /* A setup packet has been received. */
-      process_setup_packet(rhport);
-    } else if (control_stage == RUSB1_INTSTS0_CTSQ_WRITE_ZLP) {
-      /* A ZLP has been sent/received. */
+    TU_LOG3("Control stage %d\r\n", control_stage);
+    if (control_stage == RUSB1_INTSTS0_CTSQ_IDLE) {
+      // Control has gone idle, report completion
       process_status_completion(rhport);
+    } else {
+      // A setup packet has been received.
+      process_setup_packet(rhport);
     }
   }
 
