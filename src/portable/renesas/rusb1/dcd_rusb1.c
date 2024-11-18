@@ -1136,8 +1136,7 @@ void dcd_int_handler(uint8_t rhport) {
 
   /* clear active bits except VALID (don't write 0 to already cleared bits according to the HW manual) */
   rusb->INTSTS0 = ~((USB_INTSTS0_CTRT | USB_INTSTS0_DVST | USB_INTSTS0_SOFR |
-                     USB_INTSTS0_RESM | USB_INTSTS0_VBINT) &
-                    is0) |
+                     USB_INTSTS0_RESM | USB_INTSTS0_VBINT) & is0) |
                   USB_INTSTS0_VALID;
 
   // VBUS changes
