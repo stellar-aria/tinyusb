@@ -962,6 +962,9 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   dcd_int_disable(rhport);
 
   rusb->PIPESEL = pipe;
+  rusb->PIPEBUF =
+    REG_VAL(USB_PIPEBUF_BUFNMB, pipe_state->config.buffer_offset) |
+    REG_VAL(USB_PIPEBUF_BUFSIZE, pipe_state->config.buffer_size);
   rusb->PIPEMAXP = mps;
   volatile uint16_t *ctr = get_pipectr(rusb, pipe);
   // Disable auto-buffer clear and reset the data toggle
