@@ -1184,7 +1184,7 @@ void dcd_int_handler(uint8_t rhport) {
       case RUSB1_INTSTS0_DVSQ_SUSP3:
         dcd_event_bus_signal(rhport, DCD_EVENT_SUSPEND, true);
         if (!dcd->sof_enabled) {
-          REG_RMW_FIELD(rusb->INTENB0, USB_INTENB0_SOFE, 1);
+          REG_RMW_FIELD(rusb->INTENB0, USB_INTENB0_SOFE, 0);
         }
 
       default:
