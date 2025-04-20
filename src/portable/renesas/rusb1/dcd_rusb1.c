@@ -233,40 +233,16 @@ static bool sw_to_hw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
 // buf is the output buffer
 // len is the number of bytes to read
 //
-// Assumes the fifo is in 32-bit mode
-// XXX: try in 8-bit mode instead, see what perf is like and if it matters for correctness
+// Assumes the fifo is in 8-bit mode
+// XXX: try in 32-bit mode instead, see what perf is like
 static bool hw_to_sw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
-  uint32_t data;
-  while (len >= 4) {
-    data = *fifo->data;
-    tu_unaligned_write32(buf, data);
-    buf += 4;
-    len -= 4;
-  }
-
-  if (len == 0) {
-    return true;
-  }
-
-  data = *fifo->data;
-
-  #if (TU_BYTE_ORDER == TU_BIG_ENDIAN)
-  uint32_t mask = 0x00FF0000U >> (3 - len);
-  uint32_t shift = 8 * len;
-  while (mask != 0) {
-    *buf = (data & mask) >> shift;
-    buf++;
-    shift -= 8;
-    mask >>= 8;
-  }
-  #else
+  volatile uint8_t *data = (volatile uint8_t*) fifo->data;
   while (len != 0) {
-    *buf = data & 0xFFu;
-    data >>= 8;
-    len--;
+    *buf = *data;
     buf++;
+    len--;
   }
-  #endif
+
   return true;
 }
 
@@ -450,17 +426,19 @@ static bool pipe_xfer_out(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num)
   const uint16_t mps = edpt_max_packet_size(rusb, num);
   fifo_wait_for_ready(&fifo, num);
 
+  fifo_set_mbw(&fifo, RUSB1_FIFOSEL_MBW_8BIT);
+
   const uint16_t vld = REG_READ_FIELD(*fifo.ctr, USB_DnFIFOCTR_DTLN);
   const uint16_t len = tu_min16(tu_min16(rem, mps), vld);
   void *buf = pipe->buf;
 
   if (len) {
     if (pipe->ff) {
-      if (!sw_to_hw_fifo_ff(&fifo, (tu_fifo_t *) buf, len)) {
+      if (!hw_to_sw_fifo_ff(&fifo, (tu_fifo_t *) buf, len)) {
         return false;
       }
     } else {
-      if (!sw_to_hw_fifo(&fifo, buf, len)) {
+      if (!hw_to_sw_fifo(&fifo, buf, len)) {
         return false;
       }
       pipe->buf = (uint8_t *) buf + len;
