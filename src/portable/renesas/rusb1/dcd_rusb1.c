@@ -116,7 +116,7 @@ typedef struct
 // Device state for each supported peripheral
 static dcd_data_t _dcd[RUSB1_RHPORT_COUNT];
 
-TU_ATTR_ALWAYS_INLINE static dcd_data_t * dcd_for_rhport(uint8_t rhport) {
+TU_ATTR_ALWAYS_INLINE inline static dcd_data_t * dcd_for_rhport(uint8_t rhport) {
   // TODO: support disabling ports and compressing the DCD list
   return &_dcd[rhport];
 }
@@ -743,7 +743,8 @@ static void process_set_address(uint8_t rhport) {
 /* Device API
  *------------------------------------------------------------------*/
 
-void dcd_init(uint8_t rhport) {
+bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
+  (void) rh_init;
   // We always need access to the USB0 registers, as reset and oscillator
   // control is done through that port.
   struct st_usb20 *rusb0 = RUSB1_REG(0);
@@ -808,6 +809,8 @@ void dcd_init(uint8_t rhport) {
   if (REG_READ_FIELD(rusb->INTSTS0, USB_INTSTS0_VBSTS)) {
     dcd_connect(rhport);
   }
+
+  return true;
 }
 
 void dcd_int_enable(uint8_t rhport) {
