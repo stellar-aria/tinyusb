@@ -808,8 +808,8 @@ void dcd_int_disable(uint8_t rhport) {
   uint32_t const base_interrupt = 73;
   uint32_t const interrupt = base_interrupt + rhport;
 
-  // Interrupt Set Enable register enables the interrupts that have a bit set in the written value
-  volatile uint32_t *addr = (volatile uint32_t *) &INTC.ICDISER0;
+  // Interrupt Clear Enable register disables the interrupts that have a bit set in the written value
+  volatile uint32_t *addr = (volatile uint32_t *) &INTC.ICDICER0;
   uint32_t mask = 1u << (interrupt & 0x1f);
 
   *(addr + (interrupt >> 5)) = mask;
@@ -890,6 +890,8 @@ bool rusb1_configure_pipe(uint8_t rhport, uint8_t ep, tusb_dir_t ep_dir, uint8_t
   state->config = *pipe_cfg;
   state->ep = tu_edpt_addr(ep, ep_dir);
   dcd->ep[ep_dir][ep] = pipe;
+
+  return true;
 }
 
 bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
@@ -900,7 +902,78 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   const unsigned dir = tu_edpt_dir(ep_addr);
   const unsigned xfer = ep_desc->bmAttributes.xfer;
   const unsigned mps = tu_edpt_packet_size(ep_desc);
-  const unsigned pipe = dcd->ep[dir][epn];
+  unsigned pipe = dcd->ep[dir][epn];
+
+  TU_LOG2("dcd_edpt_open: EP 0x%02X (ep=%d, dir=%d) -> pipe=%d\r\n", ep_addr, epn, dir, pipe);
+
+  // If pipe not configured yet, auto-allocate one
+  if (pipe == 0) {
+    TU_LOG2("  Pipe not pre-configured, auto-allocating...\r\n");
+
+    // Find a free pipe suitable for this transfer type
+    // Pipes 6-8 for interrupt, Pipes 1-5 for bulk/iso
+    unsigned start_pipe, end_pipe;
+    if (xfer == TUSB_XFER_INTERRUPT) {
+      start_pipe = 6;
+      end_pipe = 8;
+    } else {
+      start_pipe = 1;
+      end_pipe = 5;
+    }
+
+    // Find first free pipe in range
+    for (unsigned p = start_pipe; p <= end_pipe; p++) {
+      if (dcd->pipe[p].ep == 0) {
+        pipe = p;
+        TU_LOG2("  Auto-allocated PIPE %u for EP 0x%02X (xfer=%d)\r\n", pipe, ep_addr, xfer);
+
+        // Configure the pipe
+        rusb1_pipe_config_t cfg;
+        // Blocks 0-3 are reserved for EP0, so start at block 4
+
+        if (xfer == TUSB_XFER_ISOCHRONOUS) {
+          // Isochronous endpoints need larger buffers for audio streaming
+          // Calculate buffer size based on endpoint max packet size
+          // buffer_size field: 0=64B, 1=64B, 2=128B, 3=256B, 4=512B, 5=1024B
+          unsigned buffer_size_field = 0;
+          if (mps > 512) buffer_size_field = 5;       // 1024 bytes
+          else if (mps > 256) buffer_size_field = 4;  // 512 bytes
+          else if (mps > 128) buffer_size_field = 3;  // 256 bytes
+          else if (mps > 64) buffer_size_field = 2;   // 128 bytes
+          else buffer_size_field = 1;                 // 64 bytes
+
+          cfg.buffer_offset = 4 + (p * 4);  // Larger spacing for iso pipes
+          cfg.buffer_size = buffer_size_field;
+          cfg.flags.double_buffer = 1;  // Enable double buffering for iso
+          cfg.flags.continuous = 1;     // Enable continuous mode for iso
+          TU_LOG2("  ISO endpoint: mps=%u, buffer_size_field=%u, offset=%u\r\n",
+                  mps, buffer_size_field, cfg.buffer_offset);
+        } else {
+          // Bulk/interrupt endpoints
+          // Calculate buffer size based on endpoint max packet size
+          // buffer_size field: 0=64B, 1=64B, 2=128B, 3=256B, 4=512B, 5=1024B
+          unsigned buffer_size_field = 1;  // Default 64 bytes
+          if (mps > 512) buffer_size_field = 5;       // 1024 bytes
+          else if (mps > 256) buffer_size_field = 4;  // 512 bytes
+          else if (mps > 128) buffer_size_field = 3;  // 256 bytes
+          else if (mps > 64) buffer_size_field = 2;   // 128 bytes
+
+          cfg.buffer_offset = 4 + (p * 10);  // Space pipes further apart for larger buffers
+          cfg.buffer_size = buffer_size_field;
+          cfg.flags.double_buffer = (xfer == TUSB_XFER_BULK) ? 1 : 0;
+          cfg.flags.continuous = (xfer == TUSB_XFER_BULK) ? 1 : 0;
+          TU_LOG2("  Bulk/INT endpoint: mps=%u, buffer_size_field=%u, offset=%u\r\n",
+                  mps, buffer_size_field, cfg.buffer_offset);
+        }
+
+        if (!rusb1_configure_pipe(rhport, epn, dir, pipe, &cfg)) {
+          TU_LOG2("  Failed to auto-configure pipe\r\n");
+          return false;
+        }
+        break;
+      }
+    }
+  }
 
   TU_ASSERT(0 < pipe && pipe < PIPE_COUNT);
 
@@ -935,7 +1008,20 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
     }
   #endif
 
-  unsigned pipe_buffer_size_bytes = pipe_state->config.buffer_size * RUSB1_PACKET_BUFFER_BLOCK_SIZE_BYTES;
+  // Decode buffer_size field to actual byte count
+  // buffer_size encoding: 0,1=64B, 2=128B, 3=256B, 4=512B, 5=1024B
+  unsigned pipe_buffer_size_bytes;
+  if (pipe_state->config.buffer_size <= 1) {
+    pipe_buffer_size_bytes = 64;
+  } else if (pipe_state->config.buffer_size == 2) {
+    pipe_buffer_size_bytes = 128;
+  } else if (pipe_state->config.buffer_size == 3) {
+    pipe_buffer_size_bytes = 256;
+  } else if (pipe_state->config.buffer_size == 4) {
+    pipe_buffer_size_bytes = 512;
+  } else { // 5
+    pipe_buffer_size_bytes = 1024;
+  }
   TU_ASSERT(pipe_buffer_size_bytes >= mps);
 #endif
 

@@ -83,7 +83,7 @@ TU_ATTR_ALWAYS_INLINE static inline void rusb2_int_disable(uint8_t rhport)
   uint32_t const interrupt = base_interrupt + rhport;
 
   // Interrupt Clear Enable register disables the interrupts that have a bit set in the written value
-  volatile uint32_t* addr = (volatile uint32_t*)&INTC.ICDISER0;
+  volatile uint32_t* addr = (volatile uint32_t*)&INTC.ICDICER0;
   uint32_t mask = 1u << (interrupt & 0x1f);
 
   *(addr + (interrupt >> 5)) = mask;
