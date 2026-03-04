@@ -183,6 +183,23 @@ static inline void rusb_fifo0(struct st_usb20 *rusb, rusb1_fifo_t *fifo) {
   fifo->ctr = &rusb->D0FIFOCTR;
 }
 
+static inline void rusb_fifo1(struct st_usb20 *rusb, rusb1_fifo_t *fifo) {
+  fifo->data = &rusb->D1FIFO.UINT32;
+  fifo->sel = &rusb->D1FIFOSEL;
+  fifo->ctr = &rusb->D1FIFOCTR;
+}
+
+// Route ISO pipes (1-2) to D0FIFO and bulk/interrupt pipes (3+) to D1FIFO.
+// This eliminates FIFO port contention: a bulk CDC transfer can no longer
+// block an isochronous audio transfer from accessing the hardware FIFO.
+static inline void rusb_fifo_for_pipe(struct st_usb20 *rusb, rusb1_fifo_t *fifo, unsigned pipe_num) {
+  if (pipe_num <= 2) {
+    rusb_fifo0(rusb, fifo);
+  } else {
+    rusb_fifo1(rusb, fifo);
+  }
+}
+
 static inline void fifo_wait_for_ready(rusb1_fifo_t *fifo, unsigned num) {
   while ((REG_READ_FIELD(*fifo->sel, USB_DnFIFOSEL_CURPIPE)) != num) {}
   while (!REG_READ_FIELD(*fifo->ctr, USB_CFIFOCTR_FRDY)) {}
@@ -265,9 +282,8 @@ static bool sw_to_hw_fifo_ff(rusb1_fifo_t *hw_fifo, tu_fifo_t *sw_fifo, uint16_t
     count += rem;
   }
 
-  return true;
-
   tu_fifo_advance_read_pointer(sw_fifo, count);
+  return true;
 }
 
 // Read data sw fifo <-- hw fifo
@@ -290,6 +306,7 @@ static bool hw_to_sw_fifo_ff(rusb1_fifo_t *hw_fifo, tu_fifo_t *sw_fifo, uint16_t
   }
 
   tu_fifo_advance_write_pointer(sw_fifo, count);
+  return true;
 }
 
 //--------------------------------------------------------------------+
@@ -381,7 +398,7 @@ static bool pipe_xfer_in(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num) 
     return true;
   }
 
-  rusb_fifo0(rusb, &fifo);
+  rusb_fifo_for_pipe(rusb, &fifo, num);
 
   *fifo.sel = 0 | REG_VAL(USB_DnFIFOSEL_CURPIPE, num) | REG_VAL(USB_DnFIFOSEL_MBW, RUSB1_FIFOSEL_MBW_32BIT) | (TU_BYTE_ORDER == TU_BIG_ENDIAN ? USB_DnFIFOSEL_BIGEND : 0);
 
@@ -420,7 +437,7 @@ static bool pipe_xfer_out(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num)
   const uint16_t rem = pipe->remaining;
 
   rusb1_fifo_t fifo;
-  rusb_fifo0(rusb, &fifo);
+  rusb_fifo_for_pipe(rusb, &fifo, num);
 
   *fifo.sel = REG_VAL(USB_DnFIFOSEL_CURPIPE, num);
   const uint16_t mps = edpt_max_packet_size(rusb, num);
@@ -541,7 +558,9 @@ static bool process_pipe_xfer(dcd_data_t *dcd, struct st_usb20 *rusb, int buffer
   pipe->length = total_bytes;
   pipe->remaining = total_bytes;
 
-  rusb_fifo0(rusb, &fifo);
+  TU_LOG2("process_pipe_xfer: EP %02X, pipe %d, xfer type %d, bytes %d\r\n", ep_addr, num, pipe->xfer, total_bytes);
+
+  rusb_fifo_for_pipe(rusb, &fifo, num);
 
   if (dir) {
     /* IN */
@@ -558,24 +577,36 @@ static bool process_pipe_xfer(dcd_data_t *dcd, struct st_usb20 *rusb, int buffer
     }
   } else {
     // OUT
-    volatile struct st_usb20_from_pipe1tre *pt = get_pipetre(rusb, num);
+    volatile uint16_t *ctr = get_pipectr(rusb, num);
 
-    if (pt) {
-      const uint16_t mps = edpt_max_packet_size(rusb, num);
-      volatile uint16_t *ctr = get_pipectr(rusb, num);
+    // Isochronous transfers don't use the transaction counter (TRE/TRN)
+    // They are time-based and don't use ACK/NAK handshaking
+    if (pipe->xfer == TUSB_XFER_ISOCHRONOUS) {
+      // ISO OUT: the pipe stays in BUF mode continuously (set in dcd_edpt_iso_activate).
+      // No hardware reconfiguration is needed between transfers — the pipe keeps
+      // receiving every microframe regardless.  The buffer pointers above are all
+      // that need updating.
+      (void)ctr; // PID is already BUF — nothing to do
+    } else {
+      // Bulk/Interrupt: use transaction counter
+      volatile struct st_usb20_from_pipe1tre *pt = get_pipetre(rusb, num);
 
-      // If the pipe isn't in NAK mode, set it to NAK mode so we can modify its configuration
-      if (REG_READ_FIELD(*ctr, USB_PIPEnCTR_1_5_PID) != RUSB1_PIPE_CTR_PID_NAK) {
-        *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_NAK);
+      if (pt) {
+        const uint16_t mps = edpt_max_packet_size(rusb, num);
+
+        // If the pipe isn't in NAK mode, set it to NAK mode so we can modify its configuration
+        if (REG_READ_FIELD(*ctr, USB_PIPEnCTR_1_5_PID) != RUSB1_PIPE_CTR_PID_NAK) {
+          *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_NAK);
+        }
+
+        // Clear the transaction counter and then reset it to the expected number of packets
+        pt->PIPE1TRE = USB_PIPEnTRE_TRCLR;
+        pt->PIPE1TRN = (total_bytes + mps - 1) / mps;
+        pt->PIPE1TRE = USB_PIPEnTRE_TRENB;
+
+        // re-enable the buffer state dependent NAK responses
+        *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
       }
-
-      // Clear the transaction counter and then reset it to the expected number of packets
-      pt->PIPE1TRE = USB_PIPEnTRE_TRCLR;
-      pt->PIPE1TRN = (total_bytes + mps - 1) / mps;
-      pt->PIPE1TRE = USB_PIPEnTRE_TRENB;
-
-      // re-enable the buffer state dependent NAK responses
-      *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
     }
   }
 
@@ -609,6 +640,8 @@ static void process_pipe_brdy(uint8_t rhport, unsigned num) {
   const unsigned dir = tu_edpt_dir(pipe->ep);
   bool completed;
 
+  TU_LOG2("process_pipe_brdy: pipe %d, EP %02X, dir %d\r\n", num, pipe->ep, dir);
+
   if (dir) {
     /* IN */
     completed = pipe_xfer_in(dcd, rusb, num);
@@ -620,11 +653,13 @@ static void process_pipe_brdy(uint8_t rhport, unsigned num) {
       completed = pipe0_xfer_out(dcd, rusb);
     }
   }
+
+  TU_LOG2("BRDY pipe %d completed=%d, transferred=%d\r\n", num, completed, pipe->length - pipe->remaining);
+
   if (completed) {
-    dcd_event_xfer_complete(rhport, pipe->ep,
-                            pipe->length - pipe->remaining,
-                            XFER_RESULT_SUCCESS, true);
-    //  TU_LOG1("C %d %d\r\n", num, pipe->length - pipe->remaining);
+    uint16_t xferred = pipe->length - pipe->remaining;
+    TU_LOG2("Calling dcd_event_xfer_complete: EP %02X, %d bytes\r\n", pipe->ep, xferred);
+    dcd_event_xfer_complete(rhport, pipe->ep, xferred, XFER_RESULT_SUCCESS, true);
   }
 }
 
@@ -771,17 +806,8 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   /* Setup default control pipe */
   REG_RMW_FIELD(rusb->DCPMAXP, USB_DCPMAXP_MXPS, 64);
 
-  // Clear any pending interrupts and enable all the interrupts we want on the control pipe
-  rusb->INTSTS0 = 0;
-  rusb->INTENB0 = 0
-    | USB_INTENB0_VBSE  // VBus interrupt
-    | USB_INTENB0_BRDYE // Buffer Ready
-    | USB_INTENB0_BEMPE // Buffer Empty
-    | USB_INTENB0_DVSE  // Device State change
-    | USB_INTENB0_CTRE  // Control Transfer Stage Transition
-    | USB_INTENB0_RSME; // Resume
-  rusb->BEMPENB = 1;
-  rusb->BRDYENB = 1;
+  // NOTE: Interrupt enables are set in dcd_connect() after D+ pullup is enabled,
+  // as the RZA1L peripheral requires VBUS detection before these registers become writable.
 
   // If VBUS (detect) pin is not used, application need to call tud_connect() manually after tud_init()
   if (REG_READ_FIELD(rusb->INTSTS0, USB_INTSTS0_VBSTS)) {
@@ -828,7 +854,13 @@ void dcd_remote_wakeup(uint8_t rhport) {
 void dcd_connect(uint8_t rhport) {
   struct st_usb20 *rusb = RUSB1_REG(rhport);
 
+  // Enable D+ pullup to signal device presence to host
   REG_RMW_FIELD(rusb->SYSCFG0, USB_SYSCFG_DPRPU, 1);
+
+  // NOTE: On RZA1L, interrupt enable registers (INTENB0, BEMPENB, BRDYENB) only
+  // become writable after VBUS is detected and the peripheral enters an active state.
+  // This happens asynchronously after enabling the D+ pullup.
+  // Applications must enable interrupts manually.
 }
 
 void dcd_disconnect(uint8_t rhport) {
@@ -894,6 +926,128 @@ bool rusb1_configure_pipe(uint8_t rhport, uint8_t ep, tusb_dir_t ep_dir, uint8_t
   return true;
 }
 
+//--------------------------------------------------------------------+
+// ISO Alloc/Activate - pre-allocate pipe once, activate per alt setting
+//--------------------------------------------------------------------+
+
+bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet_size) {
+  dcd_data_t *dcd = dcd_for_rhport(rhport);
+  struct st_usb20 *rusb = RUSB1_REG(rhport);
+  const unsigned epn = tu_edpt_number(ep_addr);
+  const unsigned dir = tu_edpt_dir(ep_addr);
+
+  // Find a free ISO pipe (only pipes 1-2)
+  unsigned pipe = 0;
+  for (unsigned p = 1; p <= 2; p++) {
+    if (dcd->pipe[p].ep == 0) {
+      pipe = p;
+      break;
+    }
+  }
+  TU_ASSERT(pipe != 0);
+
+  // Calculate buffer size field based on largest_packet_size
+  unsigned buffer_size_field = 1;
+  if (largest_packet_size > 512) buffer_size_field = 5;
+  else if (largest_packet_size > 256) buffer_size_field = 4;
+  else if (largest_packet_size > 128) buffer_size_field = 3;
+  else if (largest_packet_size > 64) buffer_size_field = 2;
+
+  rusb1_pipe_config_t cfg;
+  cfg.buffer_offset = 4 + (pipe * 4);
+  cfg.buffer_size = buffer_size_field;
+  cfg.flags.double_buffer = 1;
+  cfg.flags.continuous = 1;
+
+  TU_LOG2("dcd_edpt_iso_alloc: EP 0x%02X -> pipe %u, mps=%u, buf_field=%u\r\n",
+          ep_addr, pipe, largest_packet_size, buffer_size_field);
+
+  TU_ASSERT(rusb1_configure_pipe(rhport, epn, dir, pipe, &cfg));
+
+  // Now write all the hardware registers that rusb1_configure_pipe doesn't touch.
+  // rusb1_configure_pipe only sets up software state (pipe_state, ep mapping).
+  // We must configure the actual RUSB1 pipe hardware here.
+
+  dcd_int_disable(rhport);
+
+  rusb->PIPESEL = pipe;
+
+  // PIPEBUF: allocate FIFO buffer in USB controller RAM
+  rusb->PIPEBUF =
+    REG_VAL(USB_PIPEBUF_BUFNMB, cfg.buffer_offset) |
+    REG_VAL(USB_PIPEBUF_BUFSIZE, buffer_size_field);
+
+  // PIPEMAXP: set to largest packet size (will be updated per alt in iso_activate)
+  rusb->PIPEMAXP = largest_packet_size;
+
+  // PIPECFG: configure pipe type, endpoint number, direction, double-buffer
+  {
+    unsigned pipecfg = (dir << 4) | epn;
+    // Isochronous type = 0b11
+    pipecfg |= REG_VAL(USB_PIPECFG_TYPE, 0b11);
+    // Enable double-buffer mode
+    pipecfg |= REG_VAL(USB_PIPECFG_DBLB, 0b1);
+    rusb->PIPECFG = pipecfg;
+  }
+
+  // PIPEPERI: isochronous interval
+  {
+    uint16_t pipeperi = 0; // interval=0 (2^0 = 1 microframe)
+    if (dir == TUSB_DIR_IN) {
+      pipeperi |= USB_PIPEPERI_IFIS;
+    }
+    rusb->PIPEPERI = pipeperi;
+  }
+
+  // Reset pipe: clear FIFO and data toggle
+  volatile uint16_t *ctr = get_pipectr(rusb, pipe);
+  *ctr = USB_PIPEnCTR_1_5_ACLRM | USB_PIPEnCTR_1_5_SQCLR;
+  *ctr = 0;
+
+  dcd_int_enable(rhport);
+
+  return true;
+}
+
+bool dcd_edpt_iso_activate(uint8_t rhport, tusb_desc_endpoint_t const *desc_ep) {
+  dcd_data_t *dcd = dcd_for_rhport(rhport);
+  struct st_usb20 *rusb = RUSB1_REG(rhport);
+  const unsigned ep_addr = desc_ep->bEndpointAddress;
+  const unsigned epn = tu_edpt_number(ep_addr);
+  const unsigned dir = tu_edpt_dir(ep_addr);
+  const unsigned mps = tu_edpt_packet_size(desc_ep);
+  const unsigned pipe = dcd->ep[dir][epn];
+
+  TU_ASSERT(pipe == 1 || pipe == 2);
+
+  pipe_state_t *pipe_state = &dcd->pipe[pipe];
+  pipe_state->xfer = TUSB_XFER_ISOCHRONOUS;
+
+  dcd_int_disable(rhport);
+
+  rusb->PIPESEL = pipe;
+  // Update max packet size (buffer layout stays the same)
+  rusb->PIPEMAXP = mps;
+
+  // Reset the pipe: clear FIFO and data toggle
+  volatile uint16_t *ctr = get_pipectr(rusb, pipe);
+  *ctr = USB_PIPEnCTR_1_5_ACLRM | USB_PIPEnCTR_1_5_SQCLR;
+  *ctr = 0;
+
+  // Clear any pending BRDY status for this pipe and enable interrupt
+  rusb->BRDYSTS = 0x3FFu ^ TU_BIT(pipe);
+  rusb->BRDYENB |= TU_BIT(pipe);
+
+  // Set PID to BUF (accept transactions)
+  *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
+
+  dcd_int_enable(rhport);
+
+  TU_LOG2("dcd_edpt_iso_activate: EP 0x%02X pipe %u mps=%u\r\n", ep_addr, pipe, mps);
+
+  return true;
+}
+
 bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   dcd_data_t * dcd = dcd_for_rhport(rhport);
   struct st_usb20 *rusb = RUSB1_REG(rhport);
@@ -911,18 +1065,27 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
     TU_LOG2("  Pipe not pre-configured, auto-allocating...\r\n");
 
     // Find a free pipe suitable for this transfer type
-    // Pipes 6-8 for interrupt, Pipes 1-5 for bulk/iso
+    // Pipes 1-2: ISO (reserved for audio streaming)
+    // Pipes 3-5, 9-15: BULK
+    // Pipes 6-8: Interrupt
     unsigned start_pipe, end_pipe;
     if (xfer == TUSB_XFER_INTERRUPT) {
       start_pipe = 6;
       end_pipe = 8;
-    } else {
+    } else if (xfer == TUSB_XFER_ISOCHRONOUS) {
+      // Only pipes 1 and 2 support isochronous transfers
       start_pipe = 1;
-      end_pipe = 5;
+      end_pipe = 2;
+    } else {
+      // Bulk endpoints use pipes 3-5 and 9-15
+      // Pipes 1-2 are reserved for isochronous (speaker OUT + mic IN)
+      start_pipe = 3;
+      end_pipe = PIPE_COUNT - 1;
     }
 
-    // Find first free pipe in range
+    // Find first free pipe in range (skip interrupt-only pipes 6-8 for bulk)
     for (unsigned p = start_pipe; p <= end_pipe; p++) {
+      if (xfer == TUSB_XFER_BULK && p >= 6 && p <= 8) continue;
       if (dcd->pipe[p].ep == 0) {
         pipe = p;
         TU_LOG2("  Auto-allocated PIPE %u for EP 0x%02X (xfer=%d)\r\n", pipe, ep_addr, xfer);
@@ -970,6 +1133,21 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
           TU_LOG2("  Failed to auto-configure pipe\r\n");
           return false;
         }
+
+        // Configure PIPEPERI for isochronous endpoints (pipe still selected from rusb1_configure_pipe)
+        if (xfer == TUSB_XFER_ISOCHRONOUS) {
+          // IITV: Isochronous IN Transaction Interval (for high-speed: 2^(bInterval-1) microframes)
+          // IFIS: Isochronous IN Buffer Flush Select (1 = flush buffer at end of transfer)
+          uint8_t interval = ep_desc->bInterval;
+          if (interval > 0) interval -= 1;  // Convert to 0-based for IITV
+          if (interval > 7) interval = 7;   // IITV is 3 bits max
+          uint16_t pipeperi = interval;     // IITV in bits 0-2
+          if (dir == TUSB_DIR_IN) {
+            pipeperi |= USB_PIPEPERI_IFIS;  // Enable buffer flush for IN endpoints
+          }
+          rusb->PIPEPERI = pipeperi;
+          TU_LOG2("  ISO PIPEPERI: interval=%u, PIPEPERI=0x%04X\r\n", ep_desc->bInterval, pipeperi);
+        }
         break;
       }
     }
@@ -985,11 +1163,15 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   pipe_state->xfer = xfer;
 
   // Check that the endpoint and pipe configuration is valid
+  // Pipe allocation: 1-2 for ISO, 3-5/9+ for BULK, 6-8 for INTERRUPT
 #if CFG_TUSB_DEBUG
   #if TUD_OPT_HIGH_SPEED
-    if ((pipe == 1 || pipe == 2) && xfer == TUSB_XFER_ISOCHRONOUS) {
+    if (pipe == 1 || pipe == 2) {
+      // Pipes 1-2 reserved for isochronous
+      TU_ASSERT(xfer == TUSB_XFER_ISOCHRONOUS);
       TU_ASSERT(1 <= mps && mps <= 1024);
-    } else if (pipe <= 5 || pipe >= 9) {
+    } else if ((3 <= pipe && pipe <= 5) || pipe >= 9) {
+      // Pipes 3-5, 9+ for bulk
       TU_ASSERT(xfer == TUSB_XFER_BULK);
       TU_ASSERT(mps == 512);
     } else if (6 <= pipe && pipe <= 8) {
@@ -997,9 +1179,12 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
       TU_ASSERT(1 <= mps && mps <= 64);
     }
   #else
-    if ((pipe == 1 || pipe == 2) && xfer == TUSB_XFER_ISOCHRONOUS) {
+    if (pipe == 1 || pipe == 2) {
+      // Pipes 1-2 reserved for isochronous
+      TU_ASSERT(xfer == TUSB_XFER_ISOCHRONOUS);
       TU_ASSERT(1 <= mps && mps <= 1024);
-    } else if (pipe <= 5 || pipe >= 9) {
+    } else if ((3 <= pipe && pipe <= 5) || pipe >= 9) {
+      // Pipes 3-5, 9+ for bulk
       TU_ASSERT(xfer == TUSB_XFER_BULK);
       TU_ASSERT(mps == 8 || mps == 16 || mps == 32 || mps == 64);
     } else if (6 <= pipe && pipe <= 8) {
@@ -1062,6 +1247,8 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
     cfg |= REG_VAL(USB_PIPECFG_TYPE, 0b11);
     // Use double-buffer mode
     cfg |= REG_VAL(USB_PIPECFG_DBLB, 0b1);
+    // Note: CNTMD (continuous mode) is NOT used - it changes BRDY behavior
+    // in ways that may not work with TinyUSB's transfer model
     TU_ASSERT(pipe_state->config.flags.double_buffer);
     break;
   case TUSB_XFER_CONTROL:
@@ -1089,24 +1276,31 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   return true;
 }
 
-void dcd_edpt_close_all(uint8_t rhport) {
-  dcd_data_t * dcd = dcd_for_rhport(rhport);
-  unsigned i = TU_ARRAY_SIZE(dcd->pipe);
-  dcd_int_disable(rhport);
-  while (--i) { /* Close all pipes except 0 */
-    const unsigned ep_addr = dcd->pipe[i].ep;
-    if (!ep_addr) continue;
-    dcd_edpt_close(rhport, ep_addr);
-  }
-  dcd_int_enable(rhport);
-}
-
-void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) {
+static void rusb1_edpt_close(uint8_t rhport, uint8_t ep_addr) {
   dcd_data_t * dcd = dcd_for_rhport(rhport);
   struct st_usb20 *rusb = RUSB1_REG(rhport);
   const unsigned epn = tu_edpt_number(ep_addr);
   const unsigned dir = tu_edpt_dir(ep_addr);
   const unsigned num = dcd->ep[dir][epn];
+
+  if (num == 0) return; // Already closed or never opened
+
+#if CFG_TUSB_DEBUG
+  // Free packet buffer blocks that were allocated for this pipe
+  pipe_state_t* pipe_state = &dcd->pipe[num];
+  if (pipe_state->config.buffer_size > 0) {
+    const unsigned buffer_offset = pipe_state->config.buffer_offset;
+    // Must match allocation formula from rusb1_configure_pipe line 847
+    const unsigned blocks_used = pipe_state->config.buffer_size * (pipe_state->config.flags.double_buffer ? 2 : 1);
+    const unsigned last_block = buffer_offset + blocks_used;
+
+    for (int block = buffer_offset; block < last_block; ++block) {
+      uint32_t mask = 1 << (block & 0x1f);
+      unsigned block_block = block >> 5;
+      dcd->used_packet_blocks[block_block] &= ~mask;
+    }
+  }
+#endif
 
   rusb->BRDYENB &= ~TU_BIT(num);
   volatile uint16_t *ctr = get_pipectr(rusb, num);
@@ -1115,6 +1309,18 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) {
   rusb->PIPECFG = 0;
   dcd->pipe[num].ep = 0;
   dcd->ep[dir][epn] = 0;
+}
+
+void dcd_edpt_close_all(uint8_t rhport) {
+  dcd_data_t * dcd = dcd_for_rhport(rhport);
+  unsigned i = TU_ARRAY_SIZE(dcd->pipe);
+  dcd_int_disable(rhport);
+  while (--i) { /* Close all pipes except 0 */
+    const unsigned ep_addr = dcd->pipe[i].ep;
+    if (!ep_addr) continue;
+    rusb1_edpt_close(rhport, ep_addr);
+  }
+  dcd_int_enable(rhport);
 }
 
 bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t total_bytes) {

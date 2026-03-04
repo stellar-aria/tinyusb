@@ -481,6 +481,7 @@
 #elif TU_CHECK_MCU(OPT_MCU_RZA1X)
   #define TUP_USBIP_RUSB1
   #define TUP_DCD_ENDPOINT_MAX    16
+  #define TUP_DCD_EDPT_ISO_ALLOC
 
 //--------------------------------------------------------------------+
 // GigaDevice

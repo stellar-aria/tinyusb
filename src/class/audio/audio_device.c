@@ -845,9 +845,9 @@ uint16_t audiod_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint
   TU_VERIFY(TUSB_CLASS_AUDIO == itf_desc->bInterfaceClass &&
             AUDIO_SUBCLASS_CONTROL == itf_desc->bInterfaceSubClass);
 
-  // Verify version is correct - this check can be omitted
-  TU_VERIFY(itf_desc->bInterfaceProtocol == AUDIO_INT_PROTOCOL_CODE_V1 ||
-            itf_desc->bInterfaceProtocol == AUDIO_INT_PROTOCOL_CODE_V2);
+  // Verify version is correct - only accept UAC2 (protocol 0x20)
+  // This prevents claiming MIDI's Audio Control interface (protocol 0x00)
+  TU_VERIFY(itf_desc->bInterfaceProtocol == AUDIO_INT_PROTOCOL_CODE_V2);
 
   // Verify interrupt control EP is enabled if demanded by descriptor
   TU_ASSERT(itf_desc->bNumEndpoints <= 1);// 0 or 1 EPs are allowed
@@ -1840,7 +1840,17 @@ static bool audiod_calc_tx_packet_sz(audiod_function_t *audio) {
   TU_VERIFY(audio->n_channels_tx);
   TU_VERIFY(audio->n_bytes_per_sample_tx);
   TU_VERIFY(audio->interval_tx);
-  TU_VERIFY(audio->sample_rate_tx);
+
+  // For UAC2, sample_rate_tx is set by the host via SET_CUR on the clock entity.
+  // If the host hasn't sent SET_CUR yet (e.g., custom drivers using direct ISO),
+  // fall back to CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE if defined.
+  if (!audio->sample_rate_tx) {
+#ifdef CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE
+    audio->sample_rate_tx = CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE;
+#else
+    return false;
+#endif
+  }
 
   const uint8_t interval = (tud_speed_get() == TUSB_SPEED_FULL) ? audio->interval_tx : 1 << (audio->interval_tx - 1);
 
