@@ -138,11 +138,22 @@ static volatile uint16_t *get_pipectr(struct st_usb20 *rusb, unsigned num) {
 }
 
 static volatile struct st_usb20_from_pipe1tre *get_pipetre(struct st_usb20 *rusb, unsigned num) {
-  volatile struct st_usb20_from_pipe1tre *tre = NULL;
   if ((1 <= num) && (num <= 5)) {
-    tre = &((volatile struct st_usb20_from_pipe1tre *) (&rusb->PIPE1TRE))[num - 1];
+    // Pipes 1-5 are contiguous in memory — use array indexing.
+    return &((volatile struct st_usb20_from_pipe1tre *) (&rusb->PIPE1TRE))[num - 1];
   }
-  return tre;
+  // Pipes 9-F also have TRE/TRN pairs, but they are NOT contiguous with pipes 1-5
+  // (the hardware layout is B,C,D,E,F,9,A after pipe 5).  Pipes 6-8 have no TRE/TRN.
+  switch (num) {
+    case  9: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPE9TRE;
+    case 10: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPEATRE;
+    case 11: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPEBTRE;
+    case 12: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPECTRE;
+    case 13: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPEDTRE;
+    case 14: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPEETRE;
+    case 15: return (volatile struct st_usb20_from_pipe1tre *) &rusb->PIPEFTRE;
+    default: return NULL; // pipes 6-8 have no TRE/TRN registers
+  }
 }
 
 static volatile uint16_t *ep_addr_to_pipectr(uint8_t rhport, unsigned ep_addr) {
@@ -953,8 +964,21 @@ bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet
   else if (largest_packet_size > 128) buffer_size_field = 3;
   else if (largest_packet_size > 64) buffer_size_field = 2;
 
+  // Compute a non-overlapping buffer offset: find the first free block after all
+  // currently configured pipes.  A fixed stride (e.g. 4 + pipe*4) silently overlaps
+  // when buffer_size >= 3 (>128-byte frames, e.g. 44100 Hz stereo 16-bit).
+  unsigned next_offset = 4; // blocks 0-3 reserved for EP0
+  for (unsigned p = 1; p < (unsigned) PIPE_COUNT; p++) {
+    const pipe_state_t *ps = &dcd->pipe[p];
+    if (ps->ep != 0 && ps->config.buffer_size > 0) {
+      unsigned end = ps->config.buffer_offset +
+                     ps->config.buffer_size * (ps->config.flags.double_buffer ? 2 : 1);
+      if (end > next_offset) next_offset = end;
+    }
+  }
+
   rusb1_pipe_config_t cfg;
-  cfg.buffer_offset = 4 + (pipe * 4);
+  cfg.buffer_offset = next_offset;
   cfg.buffer_size = buffer_size_field;
   cfg.flags.double_buffer = 1;
   cfg.flags.continuous = 1;
@@ -1028,6 +1052,18 @@ bool dcd_edpt_iso_activate(uint8_t rhport, tusb_desc_endpoint_t const *desc_ep) 
   rusb->PIPESEL = pipe;
   // Update max packet size (buffer layout stays the same)
   rusb->PIPEMAXP = mps;
+
+  // Update PIPEPERI from the descriptor — interval and IFIS may change per alt-setting.
+  {
+    uint8_t interval = desc_ep->bInterval;
+    if (interval > 0) interval -= 1;  // bInterval is 1-based; IITV is 0-based (2^IITV microframes)
+    if (interval > 7) interval = 7;   // IITV is 3 bits
+    uint16_t pipeperi = interval;
+    if (dir == TUSB_DIR_IN) {
+      pipeperi |= USB_PIPEPERI_IFIS;  // Flush IN buffer at end of each transfer
+    }
+    rusb->PIPEPERI = pipeperi;
+  }
 
   // Reset the pipe: clear FIFO and data toggle
   volatile uint16_t *ctr = get_pipectr(rusb, pipe);
@@ -1105,7 +1141,19 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
           else if (mps > 64) buffer_size_field = 2;   // 128 bytes
           else buffer_size_field = 1;                 // 64 bytes
 
-          cfg.buffer_offset = 4 + (p * 4);  // Larger spacing for iso pipes
+          // Dynamic watermark: start after the highest occupied block.
+          {
+            unsigned next_offset = 4;
+            for (unsigned q = 1; q < (unsigned) PIPE_COUNT; q++) {
+              const pipe_state_t *ps = &dcd->pipe[q];
+              if (ps->ep != 0 && ps->config.buffer_size > 0) {
+                unsigned end = ps->config.buffer_offset +
+                               ps->config.buffer_size * (ps->config.flags.double_buffer ? 2 : 1);
+                if (end > next_offset) next_offset = end;
+              }
+            }
+            cfg.buffer_offset = next_offset;
+          }
           cfg.buffer_size = buffer_size_field;
           cfg.flags.double_buffer = 1;  // Enable double buffering for iso
           cfg.flags.continuous = 1;     // Enable continuous mode for iso
@@ -1121,7 +1169,19 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
           else if (mps > 128) buffer_size_field = 3;  // 256 bytes
           else if (mps > 64) buffer_size_field = 2;   // 128 bytes
 
-          cfg.buffer_offset = 4 + (p * 10);  // Space pipes further apart for larger buffers
+          // Dynamic watermark: start after the highest occupied block.
+          {
+            unsigned next_offset = 4;
+            for (unsigned q = 1; q < (unsigned) PIPE_COUNT; q++) {
+              const pipe_state_t *ps = &dcd->pipe[q];
+              if (ps->ep != 0 && ps->config.buffer_size > 0) {
+                unsigned end = ps->config.buffer_offset +
+                               ps->config.buffer_size * (ps->config.flags.double_buffer ? 2 : 1);
+                if (end > next_offset) next_offset = end;
+              }
+            }
+            cfg.buffer_offset = next_offset;
+          }
           cfg.buffer_size = buffer_size_field;
           cfg.flags.double_buffer = (xfer == TUSB_XFER_BULK) ? 1 : 0;
           cfg.flags.continuous = (xfer == TUSB_XFER_BULK) ? 1 : 0;
