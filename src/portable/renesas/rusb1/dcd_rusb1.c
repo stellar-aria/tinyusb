@@ -92,6 +92,7 @@ typedef struct {
   void *buf;          /* the start address of a transfer data buffer */
   uint16_t length;    /* the number of bytes in the buffer */
   uint16_t remaining; /* the number of bytes remaining in the buffer */
+  uint16_t mps;       /* max packet size, cached to avoid PIPESEL+PIPEMAXP on every BRDY */
 
   rusb1_pipe_config_t config; /* Pipe configuration */
   uint8_t xfer;               /* TUSB_XFER_* type */
@@ -211,9 +212,20 @@ static inline void rusb_fifo_for_pipe(struct st_usb20 *rusb, rusb1_fifo_t *fifo,
   }
 }
 
-static inline void fifo_wait_for_ready(rusb1_fifo_t *fifo, unsigned num) {
-  while ((REG_READ_FIELD(*fifo->sel, USB_DnFIFOSEL_CURPIPE)) != num) {}
-  while (!REG_READ_FIELD(*fifo->ctr, USB_CFIFOCTR_FRDY)) {}
+// Wait for the FIFO port to reflect the requested pipe (CURPIPE) and for
+// the FIFO buffer to become ready (FRDY).
+//
+// Returns true on success, false on failure. Callers must deselect the FIFO
+// and abort the transfer when false is returned;
+//
+static inline bool fifo_is_ready(rusb1_fifo_t *fifo, unsigned num) {
+  if ((REG_READ_FIELD(*fifo->sel, USB_DnFIFOSEL_CURPIPE)) != num) {
+    return false;
+  }
+  if (!REG_READ_FIELD(*fifo->ctr, USB_CFIFOCTR_FRDY)) {
+    return false;
+  }
+  return true;
 }
 
 static void fifo_set_mbw(rusb1_fifo_t *fifo, uint32_t mbw) {
@@ -229,7 +241,7 @@ static void fifo_set_mbw(rusb1_fifo_t *fifo, uint32_t mbw) {
 // buf is the data to write
 // len is the amount of data copy, in bytes
 static bool sw_to_hw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
-  fifo_set_mbw(fifo, RUSB1_FIFOSEL_MBW_32BIT);
+  // MBW=32 is already set by the CURPIPE select write — no initial fifo_set_mbw needed.
   while (len >= 4) {
     *fifo->data = tu_unaligned_read32(buf);
     len -= 4;
@@ -255,22 +267,45 @@ static bool sw_to_hw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
   return true;
 }
 
+// Select the widest MBW that is valid for ALL fragments of a single FIFO read.
+// MBW must not change once reading begins (TRM §28.3.8).  When a packet spans
+// the ring-buffer wrap in hw_to_sw_fifo_ff, both the linear and wrap fragments
+// must use the same width; choosing from the minimum alignment of all fragments
+// prevents an illegal mid-packet MBW switch.
+// Pass wrap=0 when there is only one fragment.
+static inline uint32_t fifo_mbw_for_frags(uint16_t lin, uint16_t wrap) {
+  if ((lin % 4 == 0) && (wrap == 0 || wrap % 4 == 0)) return RUSB1_FIFOSEL_MBW_32BIT;
+  if ((lin % 2 == 0) && (wrap == 0 || wrap % 2 == 0)) return RUSB1_FIFOSEL_MBW_16BIT;
+  return RUSB1_FIFOSEL_MBW_8BIT;
+}
+
+// Raw FIFO drain: reads `len` bytes into `buf` at the given MBW.
+// MBW must already be set in the SEL register before the first call and must
+// not change between fragments of the same packet (TRM §28.3.8).
+static inline void hw_fifo_drain(volatile uint32_t *data, uint8_t *buf, unsigned len, uint32_t mbw) {
+  if (mbw == RUSB1_FIFOSEL_MBW_32BIT) {
+    while (len >= 4) { *((uint32_t *)buf) = *data; buf += 4; len -= 4; }
+  } else if (mbw == RUSB1_FIFOSEL_MBW_16BIT) {
+    volatile uint16_t *d16 = (volatile uint16_t *)data;
+    while (len >= 2) { *((uint16_t *)buf) = *d16; buf += 2; len -= 2; }
+  } else {
+    volatile uint8_t *d8 = (volatile uint8_t *)data;
+    while (len != 0) { *buf++ = *d8; len--; }
+  }
+}
+
 // Read data buffer <-- hw fifo
 //
-// fifo is the FIFO register to read
-// buf is the output buffer
-// len is the number of bytes to read
-//
-// Assumes the fifo is in 8-bit mode
-// XXX: try in 32-bit mode instead, see what perf is like
+// On entry MBW in the SEL register is already RUSB1_FIFOSEL_MBW_32BIT (set by
+// the CURPIPE select write in pipe_xfer_out / process_pipe0_xfer).  We only
+// call fifo_set_mbw when a narrower width is required, saving one RMW P1-bus
+// access per ISO BRDY for the 4-byte-aligned (16-bit stereo) common case.
 static bool hw_to_sw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
-  volatile uint8_t *data = (volatile uint8_t*) fifo->data;
-  while (len != 0) {
-    *buf = *data;
-    buf++;
-    len--;
+  uint32_t mbw = fifo_mbw_for_frags((uint16_t)len, 0);
+  if (mbw != RUSB1_FIFOSEL_MBW_32BIT) {
+    fifo_set_mbw(fifo, mbw);
   }
-
+  hw_fifo_drain(fifo->data, buf, len, mbw);
   return true;
 }
 
@@ -298,25 +333,32 @@ static bool sw_to_hw_fifo_ff(rusb1_fifo_t *hw_fifo, tu_fifo_t *sw_fifo, uint16_t
 }
 
 // Read data sw fifo <-- hw fifo
+//
+// MBW is chosen ONCE from the combined alignment of the linear and wrap
+// fragments, then set before the first byte is read (TRM §28.3.8 compliance).
+// For HS UAC2 audio both cases are typically one fifo_set_mbw call at most:
+//   16-bit stereo (4 B/frame): 4-aligned → MBW=32 always, skip fifo_set_mbw.
+//   24-bit stereo (6 B/frame): 2-aligned → MBW=16, one call regardless of split.
 static bool hw_to_sw_fifo_ff(rusb1_fifo_t *hw_fifo, tu_fifo_t *sw_fifo, uint16_t total_len) {
   tu_fifo_buffer_info_t info;
   tu_fifo_get_write_info(sw_fifo, &info);
 
-  uint16_t count = tu_min16(total_len, info.len_lin);
-  if (!hw_to_sw_fifo(hw_fifo, info.ptr_lin, count)) {
-    return false;
+  uint16_t lin  = tu_min16(total_len, info.len_lin);
+  uint16_t wrap = total_len - lin;
+
+  // Set MBW once before the first byte is read.
+  // MBW=32 is already present from the CURPIPE select write; only switch if narrower.
+  uint32_t mbw = fifo_mbw_for_frags(lin, wrap);
+  if (mbw != RUSB1_FIFOSEL_MBW_32BIT) {
+    fifo_set_mbw(hw_fifo, mbw);
   }
 
-  uint16_t rem = total_len - count;
-  if (rem) {
-    rem = tu_min16(rem, info.len_wrap);
-    if (!hw_to_sw_fifo(hw_fifo, info.ptr_wrap, rem)) {
-      return false;
-    }
-    count += rem;
+  hw_fifo_drain(hw_fifo->data, info.ptr_lin, lin, mbw);
+  if (wrap) {
+    hw_fifo_drain(hw_fifo->data, info.ptr_wrap, wrap, mbw);
   }
 
-  tu_fifo_advance_write_pointer(sw_fifo, count);
+  tu_fifo_advance_write_pointer(sw_fifo, lin + wrap);
   return true;
 }
 
@@ -413,8 +455,13 @@ static bool pipe_xfer_in(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num) 
 
   *fifo.sel = 0 | REG_VAL(USB_DnFIFOSEL_CURPIPE, num) | REG_VAL(USB_DnFIFOSEL_MBW, RUSB1_FIFOSEL_MBW_32BIT) | (TU_BYTE_ORDER == TU_BIG_ENDIAN ? USB_DnFIFOSEL_BIGEND : 0);
 
-  const uint16_t mps = edpt_max_packet_size(rusb, num);
-  fifo_wait_for_ready(&fifo, num);
+  const uint16_t mps = pipe->mps; // cached — avoids PIPESEL write + PIPEMAXP read every BRDY
+  if (!fifo_is_ready(&fifo, num)) {
+    // FIFO not ready — leave CURPIPE as-is (the next FIFO access will
+    // overwrite it directly, matching the Renesas USBx/SDK pattern of
+    // never deselecting DnFIFO between operations).
+    return false;
+  }
   const uint16_t len = tu_min16(rem, mps);
   void *buf = pipe->buf;
 
@@ -435,8 +482,10 @@ static bool pipe_xfer_in(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num) 
     *fifo.ctr = USB_CFIFOCTR_BVAL;
   }
 
-  *fifo.sel = 0;
-  while (REG_READ_FIELD(*fifo.sel, USB_DnFIFOSEL_CURPIPE)) {} /* if CURPIPE bits changes, check written value */
+  // Leave CURPIPE pointing at this pipe — no deselect.  The next FIFO
+  // access (possibly for a different pipe) will overwrite CURPIPE directly.
+  // This eliminates the deselect→reselect cycle that caused cascading FRDY
+  // timeouts when multiple bulk pipes shared D1FIFO.
 
   pipe->remaining = rem - len;
 
@@ -445,17 +494,43 @@ static bool pipe_xfer_in(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num) 
 
 static bool pipe_xfer_out(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num) {
   pipe_state_t *pipe = &dcd->pipe[num];
-  const uint16_t rem = pipe->remaining;
 
   rusb1_fifo_t fifo;
   rusb_fifo_for_pipe(rusb, &fifo, num);
 
-  *fifo.sel = REG_VAL(USB_DnFIFOSEL_CURPIPE, num);
-  const uint16_t mps = edpt_max_packet_size(rusb, num);
-  fifo_wait_for_ready(&fifo, num);
+  // Select the pipe; MBW is initially set to 32-bit here so that CURPIPE+MBW
+  // are written simultaneously per the TRM requirement for changing CURPIPE.
+  // hw_to_sw_fifo() overrides MBW to 8-bit before the first data read —
+  // changing MBW before reading starts is compliant per TRM section 28.3.8.
+  *fifo.sel = REG_VAL(USB_DnFIFOSEL_CURPIPE, num) | REG_VAL(USB_DnFIFOSEL_MBW, RUSB1_FIFOSEL_MBW_32BIT)
+            | (TU_BYTE_ORDER == TU_BIG_ENDIAN ? USB_DnFIFOSEL_BIGEND : 0);
+  const uint16_t mps = pipe->mps; // cached — avoids PIPESEL write + PIPEMAXP read every BRDY
+  if (!fifo_is_ready(&fifo, num)) {
+    // FIFO not ready — leave CURPIPE as-is (see pipe_xfer_in comment).
+    return false;
+  }
 
-  fifo_set_mbw(&fifo, RUSB1_FIFOSEL_MBW_8BIT);
+  // Guard: if no transfer is active (spurious BRDY after completion),
+  // don't read data.
+  //
+  // For ISO OUT: we MUST still issue BCLR to release the hardware buffer back to
+  // the SIE.  ISO pipes are double-buffered and receive every microframe
+  // unconditionally.  If BCLR is not issued, the buffer stays "occupied" from
+  // the SIE's perspective; after two consecutive missed BRDYs both double-buffer
+  // banks fill up and the SIE silently drops every subsequent audio frame,
+  // causing audible artefacts whenever the class driver is even briefly late
+  // re-arming between transfers.
+  //
+  // For bulk/interrupt OUT: keep the buffer occupied (no BCLR) so the pipe NAKs
+  // until the class driver explicitly re-arms via dcd_edpt_xfer.
+  if (!pipe->buf) {
+    if (pipe->xfer == TUSB_XFER_ISOCHRONOUS) {
+      *fifo.ctr = USB_DnFIFOCTR_BCLR;
+    }
+    return false;
+  }
 
+  const uint16_t rem = pipe->remaining;
   const uint16_t vld = REG_READ_FIELD(*fifo.ctr, USB_DnFIFOCTR_DTLN);
   const uint16_t len = tu_min16(tu_min16(rem, mps), vld);
   void *buf = pipe->buf;
@@ -473,17 +548,19 @@ static bool pipe_xfer_out(dcd_data_t * dcd, struct st_usb20 *rusb, unsigned num)
     }
   }
 
-  if (len < mps) {
-    *fifo.ctr = USB_DnFIFOCTR_BCLR;
-  }
+  // Always BCLR after reading.  In single-buffer mode the SIE considers the
+  // buffer occupied until the CPU explicitly clears it.  Without BCLR after a
+  // full-size (== mps) packet the hardware NAKs every subsequent packet and
+  // BRDY never fires again.  (With double-buffering the alternate buffer
+  // masked this, but single-buffer mode requires it unconditionally.)
+  *fifo.ctr = USB_DnFIFOCTR_BCLR;
 
-  *fifo.sel = 0;
-  while (REG_READ_FIELD(*fifo.sel, USB_DnFIFOSEL_CURPIPE)) {} /* if CURPIPE bits changes, check written value */
+  // Leave CURPIPE pointing at this pipe — no deselect (see pipe_xfer_in).
 
   pipe->remaining = rem - len;
   if ((len < mps) || (rem == len)) {
     pipe->buf = NULL;
-    return NULL != buf;
+    return true;
   }
 
   return false;
@@ -524,11 +601,17 @@ static bool process_pipe0_xfer(dcd_data_t *dcd, struct st_usb20 *rusb, int buffe
   if (ep_addr) {
     /* IN, 4 bytes */
     rusb->CFIFOSEL = USB_CFIFOSEL_ISEL_ | REG_VAL(USB_CFIFOSEL_MBW, RUSB1_FIFOSEL_MBW_32BIT) | (TU_BYTE_ORDER == TU_BIG_ENDIAN ? USB_CFIFOSEL_BIGEND : 0);
-    while (!(rusb->CFIFOSEL & USB_CFIFOSEL_ISEL_)) {}
+    // Wait for the ISEL direction bit to take effect.  CFIFOSEL register echoes
+    // back the new value within a few P1-bus cycles; 1000 iterations @ 33MHz ≈ 30µs
+    // which is far more than enough for a register echo.  The bound prevents an
+    // infinite stall if the peripheral is in a bad state during enumeration.
+    unsigned isel_tries = 1000;
+    while (!(rusb->CFIFOSEL & USB_CFIFOSEL_ISEL_) && --isel_tries) {}
   } else {
     /* OUT, a byte */
     rusb->CFIFOSEL = REG_VAL(USB_CFIFOSEL_MBW, RUSB1_FIFOSEL_MBW_32BIT);
-    while (rusb->CFIFOSEL & USB_CFIFOSEL_ISEL_) {}
+    unsigned isel_tries = 1000;
+    while ((rusb->CFIFOSEL & USB_CFIFOSEL_ISEL_) && --isel_tries) {}
   }
 
   pipe_state_t *pipe = &dcd->pipe[0];
@@ -575,16 +658,54 @@ static bool process_pipe_xfer(dcd_data_t *dcd, struct st_usb20 *rusb, int buffer
 
   if (dir) {
     /* IN */
+    volatile uint16_t *ctr = get_pipectr(rusb, num);
+
     if (total_bytes) {
+      const unsigned rem_before = pipe->remaining;
       pipe_xfer_in(dcd, rusb, num);
+
+      // If pipe_xfer_in failed to write any data (e.g. FRDY timeout because
+      // both double-buffer slots are full), do NOT set PID=BUF.  Arming the
+      // pipe with an empty FIFO creates a ghost transfer: the SIE NAKs all
+      // host IN tokens (no data to send), BRDY never fires (no full→empty
+      // transition), and the pipe is stuck forever.
+      //
+      // Instead, reset the pipe state and return false so the class driver
+      // can retry later.
+      if (pipe->remaining == rem_before && rem_before > 0) {
+        pipe->buf = NULL;
+        pipe->remaining = 0;
+        pipe->length = 0;
+        return false;
+      }
     } else {
       /* ZLP */
       *fifo.sel = num;
-      fifo_wait_for_ready(&fifo, num);
+      if (!fifo_is_ready(&fifo, num)) {
+        // FIFO not ready for ZLP — leave CURPIPE as-is (see pipe_xfer_in).
+        return false;
+      }
       /* Immediately mark the buffer as "ready", causing the peripheral to ACK */
       *fifo.ctr = USB_DnFIFOCTR_BVAL;
-      *fifo.sel = 0;
-      while (REG_READ_FIELD(*fifo.sel, USB_DnFIFOSEL_CURPIPE) != 0) {}
+      // Leave CURPIPE pointing at this pipe — no deselect.
+    }
+
+    // Re-arm the pipe to BUF for bulk and interrupt IN endpoints.
+    //
+    // Bulk IN pipes are opened with SHTNAK=1: after the SIE sends the last
+    // (short) packet the hardware reverts PID to NAK automatically.  If the
+    // main loop is slow to re-submit (e.g. while draining audio), the pipe
+    // stays NAK and the next dcd_edpt_xfer() writes data to the FIFO but the
+    // SIE never transmits it — ep.busy is stuck at 1 forever.
+    //
+    // Fix: explicitly set PID=BUF here, after we have written data into the
+    // FIFO.  Writing BUF when the pipe is already BUF is harmless.
+    //
+    // ISO IN pipes use continuous BUF mode managed by dcd_edpt_iso_activate;
+    // they must NOT be touched here — changing their PID mid-stream disrupts
+    // the isochronous schedule.
+    if (pipe->xfer != TUSB_XFER_ISOCHRONOUS) {
+      *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
     }
   } else {
     // OUT
@@ -599,29 +720,36 @@ static bool process_pipe_xfer(dcd_data_t *dcd, struct st_usb20 *rusb, int buffer
       // that need updating.
       (void)ctr; // PID is already BUF — nothing to do
     } else {
-      // Bulk/Interrupt: use transaction counter
+      // Bulk/Interrupt OUT: do NOT use the transaction counter (TRE/TRN).
+      //
+      // The USBx reference driver never enables TRE — it relies solely on
+      // SHTNAK (auto-NAK after a short packet) and manual PID=BUF re-arm.
+      //
+      // Using TRN=1 with double-buffering is problematic: at High-Speed the
+      // host can send back-to-back packets faster than the SIE decrements
+      // TRN, causing the second packet to be accepted into the alternate
+      // buffer.  When the firmware drains only the first buffer and re-arms
+      // with a fresh TRN=1, the stale second buffer triggers a spurious
+      // BRDY or is silently lost, eventually stalling the pipe.
+      //
+      // Instead: simply ensure PID=BUF so the pipe accepts packets.  BRDY
+      // fires on each received packet; pipe_xfer_out drains the buffer and
+      // reports completion when a short packet arrives (len < mps) or the
+      // requested byte count is reached.
+
+      // Make sure TRE is disabled (clear TRENB) so the hardware transaction
+      // counter doesn't interfere.
       volatile struct st_usb20_from_pipe1tre *pt = get_pipetre(rusb, num);
-
       if (pt) {
-        const uint16_t mps = edpt_max_packet_size(rusb, num);
-
-        // If the pipe isn't in NAK mode, set it to NAK mode so we can modify its configuration
-        if (REG_READ_FIELD(*ctr, USB_PIPEnCTR_1_5_PID) != RUSB1_PIPE_CTR_PID_NAK) {
-          *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_NAK);
-        }
-
-        // Clear the transaction counter and then reset it to the expected number of packets
         pt->PIPE1TRE = USB_PIPEnTRE_TRCLR;
-        pt->PIPE1TRN = (total_bytes + mps - 1) / mps;
-        pt->PIPE1TRE = USB_PIPEnTRE_TRENB;
-
-        // re-enable the buffer state dependent NAK responses
-        *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
       }
+
+      // Set PID=BUF to accept incoming packets
+      *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
     }
   }
 
-  //  TU_LOG2("X %x %d %d\r\n", ep_addr, total_bytes, buffer_type);
+  TU_LOG2("X %x %d %d\r\n", ep_addr, total_bytes, buffer_type);
   return true;
 }
 
@@ -659,7 +787,26 @@ static void process_pipe_brdy(uint8_t rhport, unsigned num) {
   } else {
     // OUT
     if (num) {
+      // For bulk/interrupt OUT pipes: set PID=NAK BEFORE reading the FIFO.
+      //
+      // All bulk OUT pipes are single-buffer (see endpoint-open comment).
+      // By setting NAK while the buffer is still full, the host can't land
+      // a new packet in the window between BCLR and re-arm.
+      //
+      // ISO OUT stays in continuous BUF mode — no NAK.
+      bool needs_nak = (pipe->xfer != TUSB_XFER_ISOCHRONOUS);
+      volatile uint16_t *ctr = NULL;
+      if (needs_nak) {
+        ctr = get_pipectr(rusb, num);
+        *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_NAK);
+      }
+
       completed = pipe_xfer_out(dcd, rusb, num);
+
+      // Re-arm to BUF if the transfer needs more data.
+      if (!completed && needs_nak && pipe->buf) {
+        *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
+      }
     } else {
       completed = pipe0_xfer_out(dcd, rusb);
     }
@@ -719,9 +866,10 @@ static void process_bus_reset(uint8_t rhport) {
   dcd->used_packet_blocks[0] |= 0b1111;
 #endif
   // This is automatically set on peripheral reset, make sure our internal tracking matches it.
-  dcd->pipe[0].config.buffer_size = 4;
+  // EP0 uses 4 blocks = 256 bytes, BUFSIZE = 4-1 = 3
+  dcd->pipe[0].config.buffer_size = 3;
 
-  TU_LOG3("Bus reset, RHST = %u\r\n", REG_READ_FIELD(rusb->DVSTCTR0, USB_DVSTCTR0_RHST));
+  TU_LOG2("Bus reset, RHST = %u\r\n", REG_READ_FIELD(rusb->DVSTCTR0, USB_DVSTCTR0_RHST));
   tusb_speed_t speed;
   switch (REG_READ_FIELD(rusb->DVSTCTR0, USB_DVSTCTR0_RHST)) {
     case RUSB1_DVSTCTR0_RHST_LS:
@@ -890,7 +1038,9 @@ void dcd_sof_enable(uint8_t rhport, bool en) {
 //--------------------------------------------------------------------+
 bool rusb1_configure_pipe(uint8_t rhport, uint8_t ep, tusb_dir_t ep_dir, uint8_t pipe, rusb1_pipe_config_t const * pipe_cfg) {
   const unsigned buffer_offset = pipe_cfg->buffer_offset;
-  const unsigned blocks_used = pipe_cfg->buffer_size * (pipe_cfg->flags.double_buffer ? 2 : 1);
+  // BUFSIZE register encoding: buffer_bytes = 64 * (BUFSIZE + 1)
+  // Number of 64-byte blocks per buffer = (BUFSIZE + 1)
+  const unsigned blocks_used = (pipe_cfg->buffer_size + 1) * (pipe_cfg->flags.double_buffer ? 2 : 1);
 
   // Pipe 0 is autoconfigured by peripheral reset, there are only
   TU_ASSERT(1 <= pipe && pipe < PIPE_COUNT);
@@ -899,15 +1049,15 @@ bool rusb1_configure_pipe(uint8_t rhport, uint8_t ep, tusb_dir_t ep_dir, uint8_t
   // Only pipes 1-5 and 9-15 are allowed to use double-buffer mode.
   TU_ASSERT(!pipe_cfg->flags.double_buffer || pipe <= 5 || pipe >= 9);
 
-  // All pipes must be <= 2048 bytes in length
-  TU_ASSERT(pipe_cfg->buffer_size <= 2048 / RUSB1_PACKET_BUFFER_BLOCK_SIZE_BYTES);
+  // All pipes must be <= 2048 bytes in length (BUFSIZE max = (2048/64)-1 = 31)
+  TU_ASSERT(pipe_cfg->buffer_size <= (2048 / RUSB1_PACKET_BUFFER_BLOCK_SIZE_BYTES) - 1);
 
   switch(pipe) {
   case 6:
   case 7:
   case 8:
-    // The interrupt pipes (6-8) only support 1-block buffers
-    TU_ASSERT(pipe_cfg->buffer_size == 1);
+    // The interrupt pipes (6-8) only support 1-block buffers (BUFSIZE=0 → 64B)
+    TU_ASSERT(pipe_cfg->buffer_size == 0);
     break;
   default:
     break;
@@ -957,12 +1107,11 @@ bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet
   }
   TU_ASSERT(pipe != 0);
 
-  // Calculate buffer size field based on largest_packet_size
-  unsigned buffer_size_field = 1;
-  if (largest_packet_size > 512) buffer_size_field = 5;
-  else if (largest_packet_size > 256) buffer_size_field = 4;
-  else if (largest_packet_size > 128) buffer_size_field = 3;
-  else if (largest_packet_size > 64) buffer_size_field = 2;
+  // Calculate PIPEBUF BUFSIZE field.
+  // Hardware encoding: buffer_bytes = 64 * (BUFSIZE + 1)
+  // BUFSIZE = (ceil_to_64(mps) / 64) - 1
+  unsigned buffer_size_field = ((largest_packet_size + 63) / 64) - 1;
+  if (buffer_size_field > 31) buffer_size_field = 31; // 5-bit field max
 
   // Compute a non-overlapping buffer offset: find the first free block after all
   // currently configured pipes.  A fixed stride (e.g. 4 + pipe*4) silently overlaps
@@ -970,12 +1119,16 @@ bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet
   unsigned next_offset = 4; // blocks 0-3 reserved for EP0
   for (unsigned p = 1; p < (unsigned) PIPE_COUNT; p++) {
     const pipe_state_t *ps = &dcd->pipe[p];
-    if (ps->ep != 0 && ps->config.buffer_size > 0) {
+    if (ps->ep != 0) {
       unsigned end = ps->config.buffer_offset +
-                     ps->config.buffer_size * (ps->config.flags.double_buffer ? 2 : 1);
+                     (ps->config.buffer_size + 1) * (ps->config.flags.double_buffer ? 2 : 1);
       if (end > next_offset) next_offset = end;
     }
   }
+
+  // BUFNMB must be aligned to (BUFSIZE+1) block boundary per hardware requirement.
+  const unsigned alignment = buffer_size_field + 1;
+  next_offset = (next_offset + alignment - 1) & ~(alignment - 1);
 
   rusb1_pipe_config_t cfg;
   cfg.buffer_offset = next_offset;
@@ -987,6 +1140,7 @@ bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet
           ep_addr, pipe, largest_packet_size, buffer_size_field);
 
   TU_ASSERT(rusb1_configure_pipe(rhport, epn, dir, pipe, &cfg));
+  dcd->pipe[pipe].mps = largest_packet_size; // will be refined per alt-setting in iso_activate
 
   // Now write all the hardware registers that rusb1_configure_pipe doesn't touch.
   // rusb1_configure_pipe only sets up software state (pipe_state, ep mapping).
@@ -1046,6 +1200,7 @@ bool dcd_edpt_iso_activate(uint8_t rhport, tusb_desc_endpoint_t const *desc_ep) 
 
   pipe_state_t *pipe_state = &dcd->pipe[pipe];
   pipe_state->xfer = TUSB_XFER_ISOCHRONOUS;
+  pipe_state->mps  = (uint16_t)mps; // update cached MPS for this alt-setting
 
   dcd_int_disable(rhport);
 
@@ -1132,61 +1287,70 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
 
         if (xfer == TUSB_XFER_ISOCHRONOUS) {
           // Isochronous endpoints need larger buffers for audio streaming
-          // Calculate buffer size based on endpoint max packet size
-          // buffer_size field: 0=64B, 1=64B, 2=128B, 3=256B, 4=512B, 5=1024B
-          unsigned buffer_size_field = 0;
-          if (mps > 512) buffer_size_field = 5;       // 1024 bytes
-          else if (mps > 256) buffer_size_field = 4;  // 512 bytes
-          else if (mps > 128) buffer_size_field = 3;  // 256 bytes
-          else if (mps > 64) buffer_size_field = 2;   // 128 bytes
-          else buffer_size_field = 1;                 // 64 bytes
+          // BUFSIZE = (ceil_to_64(mps) / 64) - 1; buffer_bytes = 64*(BUFSIZE+1)
+          unsigned buffer_size_field = ((mps + 63) / 64) - 1;
+          if (buffer_size_field > 31) buffer_size_field = 31;
 
           // Dynamic watermark: start after the highest occupied block.
           {
             unsigned next_offset = 4;
             for (unsigned q = 1; q < (unsigned) PIPE_COUNT; q++) {
               const pipe_state_t *ps = &dcd->pipe[q];
-              if (ps->ep != 0 && ps->config.buffer_size > 0) {
+              if (ps->ep != 0) {
                 unsigned end = ps->config.buffer_offset +
-                               ps->config.buffer_size * (ps->config.flags.double_buffer ? 2 : 1);
+                               (ps->config.buffer_size + 1) * (ps->config.flags.double_buffer ? 2 : 1);
                 if (end > next_offset) next_offset = end;
               }
             }
+            // BUFNMB must be aligned to (BUFSIZE+1) block boundary per hardware requirement.
+            const unsigned iso_align = buffer_size_field + 1;
+            next_offset = (next_offset + iso_align - 1) & ~(iso_align - 1);
             cfg.buffer_offset = next_offset;
           }
           cfg.buffer_size = buffer_size_field;
           cfg.flags.double_buffer = 1;  // Enable double buffering for iso
           cfg.flags.continuous = 1;     // Enable continuous mode for iso
-          TU_LOG2("  ISO endpoint: mps=%u, buffer_size_field=%u, offset=%u\r\n",
-                  mps, buffer_size_field, cfg.buffer_offset);
+          TU_LOG2("  ISO endpoint: mps=%u, BUFSIZE=%u (%uB), offset=%u\r\n",
+                  mps, buffer_size_field, 64*(buffer_size_field+1), cfg.buffer_offset);
         } else {
           // Bulk/interrupt endpoints
-          // Calculate buffer size based on endpoint max packet size
-          // buffer_size field: 0=64B, 1=64B, 2=128B, 3=256B, 4=512B, 5=1024B
-          unsigned buffer_size_field = 1;  // Default 64 bytes
-          if (mps > 512) buffer_size_field = 5;       // 1024 bytes
-          else if (mps > 256) buffer_size_field = 4;  // 512 bytes
-          else if (mps > 128) buffer_size_field = 3;  // 256 bytes
-          else if (mps > 64) buffer_size_field = 2;   // 128 bytes
+          // BUFSIZE = (ceil_to_64(mps) / 64) - 1; buffer_bytes = 64*(BUFSIZE+1)
+          unsigned buffer_size_field = ((mps + 63) / 64) - 1;
+          if (buffer_size_field > 31) buffer_size_field = 31;
 
           // Dynamic watermark: start after the highest occupied block.
           {
             unsigned next_offset = 4;
             for (unsigned q = 1; q < (unsigned) PIPE_COUNT; q++) {
               const pipe_state_t *ps = &dcd->pipe[q];
-              if (ps->ep != 0 && ps->config.buffer_size > 0) {
+              if (ps->ep != 0) {
                 unsigned end = ps->config.buffer_offset +
-                               ps->config.buffer_size * (ps->config.flags.double_buffer ? 2 : 1);
+                               (ps->config.buffer_size + 1) * (ps->config.flags.double_buffer ? 2 : 1);
                 if (end > next_offset) next_offset = end;
               }
             }
+            // BUFNMB must be aligned to (BUFSIZE+1) block boundary per hardware requirement.
+            const unsigned bulk_align = buffer_size_field + 1;
+            next_offset = (next_offset + bulk_align - 1) & ~(bulk_align - 1);
             cfg.buffer_offset = next_offset;
           }
           cfg.buffer_size = buffer_size_field;
-          cfg.flags.double_buffer = (xfer == TUSB_XFER_BULK) ? 1 : 0;
-          cfg.flags.continuous = (xfer == TUSB_XFER_BULK) ? 1 : 0;
-          TU_LOG2("  Bulk/INT endpoint: mps=%u, buffer_size_field=%u, offset=%u\r\n",
-                  mps, buffer_size_field, cfg.buffer_offset);
+          // Single-buffer for all bulk/interrupt OUT endpoints.
+          //
+          // Double-buffering for bulk OUT causes a race: if a BRDY fires for
+          // the alternate bank while pipe->buf==NULL (between transfer
+          // completion and the class driver re-arming via tud_task), the guard
+          // returns without issuing BCLR.  The unread alternate bank then
+          // prevents the SIE from accepting further packets, silently dropping
+          // the tail of multi-packet messages (e.g. the last 259 bytes of a
+          // 771-byte UpdateDisplay frame, corrupting the OLED bottom quarter).
+          //
+          // Bulk IN endpoints use double-buffering: the SIE can transmit from
+          // bank A while the CPU fills bank B, with no buf==NULL race.
+          cfg.flags.double_buffer = (dir == TUSB_DIR_IN && xfer == TUSB_XFER_BULK) ? 1 : 0;
+          cfg.flags.continuous = 0;
+          TU_LOG2("  Bulk/INT endpoint: mps=%u, BUFSIZE=%u (%uB), offset=%u, dblb=%u\r\n",
+                  mps, buffer_size_field, 64*(buffer_size_field+1), cfg.buffer_offset, cfg.flags.double_buffer);
         }
 
         if (!rusb1_configure_pipe(rhport, epn, dir, pipe, &cfg)) {
@@ -1221,6 +1385,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   TU_ASSERT(pipe_state->ep == ep_addr);
 
   pipe_state->xfer = xfer;
+  pipe_state->mps  = (uint16_t)mps; // cache to avoid PIPESEL+PIPEMAXP on every BRDY
 
   // Check that the endpoint and pipe configuration is valid
   // Pipe allocation: 1-2 for ISO, 3-5/9+ for BULK, 6-8 for INTERRUPT
@@ -1253,20 +1418,9 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
     }
   #endif
 
-  // Decode buffer_size field to actual byte count
-  // buffer_size encoding: 0,1=64B, 2=128B, 3=256B, 4=512B, 5=1024B
-  unsigned pipe_buffer_size_bytes;
-  if (pipe_state->config.buffer_size <= 1) {
-    pipe_buffer_size_bytes = 64;
-  } else if (pipe_state->config.buffer_size == 2) {
-    pipe_buffer_size_bytes = 128;
-  } else if (pipe_state->config.buffer_size == 3) {
-    pipe_buffer_size_bytes = 256;
-  } else if (pipe_state->config.buffer_size == 4) {
-    pipe_buffer_size_bytes = 512;
-  } else { // 5
-    pipe_buffer_size_bytes = 1024;
-  }
+  // Decode BUFSIZE register value to actual byte count
+  // Hardware encoding: buffer_bytes = 64 * (BUFSIZE + 1)
+  unsigned pipe_buffer_size_bytes = 64 * (pipe_state->config.buffer_size + 1);
   TU_ASSERT(pipe_buffer_size_bytes >= mps);
 #endif
 
@@ -1291,11 +1445,13 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
   case TUSB_XFER_BULK:
     // BULK type
     cfg |= REG_VAL(USB_PIPECFG_TYPE, 0b01);
-    // Disable pipe after transfer
+    // Auto-NAK on short packet receipt (OUT only; harmless for IN)
     cfg |= REG_VAL(USB_PIPECFG_SHTNAK, 0b1);
-    // Use double-buffer mode
-    cfg |= REG_VAL(USB_PIPECFG_DBLB, 0b1);
-    TU_ASSERT(pipe_state->config.flags.double_buffer);
+    // Double-buffering for bulk IN only — bulk OUT must be single-buffer
+    // to avoid the buf==NULL BRDY race (see endpoint-open comment above).
+    if (pipe_state->config.flags.double_buffer) {
+      cfg |= REG_VAL(USB_PIPECFG_DBLB, 0b1);
+    }
     break;
   case TUSB_XFER_INTERRUPT:
     // INTERRUPT mode
@@ -1330,7 +1486,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *ep_desc) {
     *ctr = REG_VAL(USB_PIPEnCTR_1_5_PID, RUSB1_PIPE_CTR_PID_BUF);
   }
 
-  // TU_LOG1("O %d %x %x\r\n", rusb->PIPESEL, rusb->PIPECFG, rusb->PIPEMAXP);
+  TU_LOG1("O %d %x %x\r\n", rusb->PIPESEL, rusb->PIPECFG, rusb->PIPEMAXP);
   dcd_int_enable(rhport);
 
   return true;
@@ -1350,8 +1506,8 @@ static void rusb1_edpt_close(uint8_t rhport, uint8_t ep_addr) {
   pipe_state_t* pipe_state = &dcd->pipe[num];
   if (pipe_state->config.buffer_size > 0) {
     const unsigned buffer_offset = pipe_state->config.buffer_offset;
-    // Must match allocation formula from rusb1_configure_pipe line 847
-    const unsigned blocks_used = pipe_state->config.buffer_size * (pipe_state->config.flags.double_buffer ? 2 : 1);
+    // Must match allocation formula from rusb1_configure_pipe
+    const unsigned blocks_used = (pipe_state->config.buffer_size + 1) * (pipe_state->config.flags.double_buffer ? 2 : 1);
     const unsigned last_block = buffer_offset + blocks_used;
 
     for (int block = buffer_offset; block < last_block; ++block) {
@@ -1491,8 +1647,19 @@ void dcd_int_handler(uint8_t rhport) {
 
   // SOF received
   if ((is0 & USB_INTSTS0_SOFR) && REG_READ_FIELD(rusb->INTENB0, USB_INTENB0_SOFE)) {
-    // USBD will exit suspended mode when SOF event is received
-    const uint32_t frame = REG_READ_FIELD(rusb->FRMNUM, USB_FRMNUM_FRNM);
+    // USBD will exit suspended mode when SOF event is received.
+    // Also check for CRC errors and FIFO overruns here — FRMNUM is only read
+    // when we are already paying the cost of a SOF handler entry (1ms / 125µs),
+    // avoiding an unconditional register fetch on every BRDY ISR.
+    const uint16_t frmnum = rusb->FRMNUM;
+    if (frmnum & (USB_FRMNUM_CRCE | USB_FRMNUM_OVRN)) {
+      TU_LOG1("USB ERR: FRMNUM=0x%04X%s%s\r\n", frmnum,
+              (frmnum & USB_FRMNUM_CRCE) ? " CRCE" : "",
+              (frmnum & USB_FRMNUM_OVRN) ? " OVRN" : "");
+      // Clear sticky error flags (write 0 to clear)
+      rusb->FRMNUM = (uint16_t)~(USB_FRMNUM_CRCE | USB_FRMNUM_OVRN);
+    }
+    const uint32_t frame = REG_READ_FIELD(frmnum, USB_FRMNUM_FRNM);
     dcd_event_sof(rhport, frame, true);
     if (!dcd->sof_enabled) {
       REG_RMW_FIELD(rusb->INTENB0, USB_INTENB0_SOFE, 0);
@@ -1527,7 +1694,7 @@ void dcd_int_handler(uint8_t rhport) {
   // Control transfer stage changes
   if (is0 & USB_INTSTS0_CTRT) {
     unsigned control_stage = REG_READ_FIELD(is0, USB_INTSTS0_CTSQ);
-    TU_LOG3("Control stage %d\r\n", control_stage);
+    TU_LOG2("Control stage %d\r\n", control_stage);
     if (control_stage == RUSB1_INTSTS0_CTSQ_IDLE) {
       // Control has gone idle, report completion
       process_status_completion(rhport);
@@ -1537,21 +1704,30 @@ void dcd_int_handler(uint8_t rhport) {
     }
   }
 
-  // Buffer empty
+  // Buffer empty (fires only for pipe 0 control IN — infrequently).
   if (is0 & USB_INTSTS0_BEMP) {
-    const uint16_t s = rusb->BEMPSTS;
-    rusb->BEMPSTS = 0;
-    if (s & 1) {
+    // Read BEMPENB-masked status so we only act on enabled pipes, and only
+    // clear the bits we actually read (per TRM: don't write 0 to bits we
+    // didn't observe — they may have been set by hardware since the read).
+    const uint16_t m_bemp = rusb->BEMPENB;
+    const uint16_t s_bemp = rusb->BEMPSTS & m_bemp;
+    rusb->BEMPSTS = (uint16_t)~s_bemp; // RC-W0: clear only what we saw
+    if (s_bemp & 1) {
       process_pipe0_bemp(rhport);
     }
   }
 
-  // Buffer ready
+  // Buffer ready — hot path at bInterval=1 HS (up to 16 000 BRDY events/sec
+  // across 2 ISO pipes + CDC + MIDI).  ISO audio pipes are on D0FIFO (pipes
+  // 1-2) while CDC/MIDI are on D1FIFO (pipes 3+), so no FIFO port contention
+  // exists between groups.  We process both groups in a single masked pass;
+  // __builtin_ctz naturally picks the lowest-numbered pipe first, which means
+  // ISO pipe 1 → ISO pipe 2 → bulk/interrupt pipes, matching hardware priority.
   if (is0 & USB_INTSTS0_BRDY) {
     const unsigned m = rusb->BRDYENB;
     unsigned s = rusb->BRDYSTS & m;
     /* clear active bits (don't write 0 to already cleared bits according to the HW manual) */
-    rusb->BRDYSTS = ~s;
+    rusb->BRDYSTS = (uint16_t)~s;
     while (s) {
       const unsigned num = __builtin_ctz(s);
       process_pipe_brdy(rhport, num);
