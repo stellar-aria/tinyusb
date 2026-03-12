@@ -300,7 +300,23 @@ static inline void hw_fifo_drain(volatile uint32_t *data, uint8_t *buf, unsigned
 // the CURPIPE select write in pipe_xfer_out / process_pipe0_xfer).  We only
 // call fifo_set_mbw when a narrower width is required, saving one RMW P1-bus
 // access per ISO BRDY for the 4-byte-aligned (16-bit stereo) common case.
+//
+// RZA1 hardware quirk: writing D1FIFOSEL (even to change only MBW with CURPIPE
+// unchanged) re-triggers the FIFO data-port switching state machine.  If the
+// first data read happens before the port settles the hardware returns 0xFF.
+// For payloads shorter than one 32-bit word we avoid the MBW change entirely:
+// read a single MBW=32 word (already configured) and unpack the valid bytes.
+// TRM §28.3.8 specifies that the hardware pads short FIFO reads to the full
+// MBW width, so the first `len` bytes are always valid regardless of padding.
 static bool hw_to_sw_fifo(rusb1_fifo_t *fifo, uint8_t *buf, unsigned len) {
+  if (len < 4) {
+    // Sub-word payload: keep MBW=32, read one word, unpack valid bytes.
+    uint32_t word = *fifo->data;
+    if (len >= 1) *buf++ = (uint8_t)(word);
+    if (len >= 2) *buf++ = (uint8_t)(word >> 8);
+    if (len >= 3) *buf++ = (uint8_t)(word >> 16);
+    return true;
+  }
   uint32_t mbw = fifo_mbw_for_frags((uint16_t)len, 0);
   if (mbw != RUSB1_FIFOSEL_MBW_32BIT) {
     fifo_set_mbw(fifo, mbw);
